@@ -1,9 +1,25 @@
 # requirements.txt
 
-# Training dependencies
-ksim==0.1.3
-xax==0.3.0
-mujoco-scenes
+# Core training dependencies
+ksim==0.2.10
+xax==0.4.4
+
+# JAX and ML dependencies (compatible with ksim 0.2.10)
+jax==0.7.1
+jaxlib==0.7.1
+jaxtyping==0.3.3
+optax==0.2.6
+distrax==0.1.7
+equinox==0.13.2
+attrs==25.4.0
+
+# Physics simulation
+mujoco==3.3.7
+mujoco-mjx==3.3.7
+mujoco-scenes==0.0.17
+
+# Protobuf version constraint (required for JAX 0.7.1 compatibility)
+protobuf<4
 
 # Inference dependencies
 kinfer[jax]

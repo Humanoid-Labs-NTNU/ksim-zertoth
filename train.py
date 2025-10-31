@@ -3,7 +3,9 @@
 import asyncio
 import logging
 import math
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Self, TypedDict
 
 import attrs
@@ -32,22 +34,24 @@ ROBOT_CONFIGS = {
         "com_inertia_size": 190,  # Actual size from environment for 16 joints + IMU link
         "com_velocity_size": 114,  # Actual size from environment for 16 joints + IMU link
         "joint_biases": [
-            ("right_hip_pitch", -0.0, 0.01),  # 0, range=[-1.570796, 1.570796]
-            ("right_hip_yaw", 0.0, 1.0),  # 1, range=[-1.570796, 0.087266]
-            ("right_hip_roll", -0.78, 1.0),  # 2, range=[-0.785398, 0.785398]
-            ("right_knee_pitch", -3.6, 0.01),  # 3, range=[-4.712389, -1.570796]
-            ("right_ankle_pitch", -0.0, 0.01),  # 4, range=[-1.570796, 1.570796]
-            ("left_hip_pitch", -0.0, 0.01),  # 5, range=[-1.570796, 1.570796]
-            ("left_hip_yaw", 0.0, 1.0),  # 6, range=[-1.570796, 0.087266]
-            ("left_hip_roll", 0.78, 1.0),  # 7, range=[-0.785398, 0.785398]
-            ("left_knee_pitch", -0.0, 0.01),  # 8, range=[-1.570796, 1.570796]
-            ("left_ankle_pitch", -0.0, 0.01),  # 9, range=[-1.570796, 1.570796]
-            ("right_shoulder_pitch", 0.0, 1.0),  # 10, range=[-1.745329, 1.745329]
-            ("right_shoulder_yaw", -0.2, 1.0),  # 11, range=[-1.134464, 0.872665]
-            ("right_elbow_yaw", 0.2, 1.0),  # 12, range=[-1.570796, 1.570796]
-            ("left_shoulder_pitch", 0.0, 1.0),  # 13, range=[-1.745329, 1.745329]
-            ("left_shoulder_yaw", 0.2, 1.0),  # 14, range=[-1.134464, 0.872665]
-            ("left_elbow_yaw", -0.2, 1.0),  # 15, range=[-1.570796, 1.570796]
+            # Arms first (qposadr 7-12)
+            ("right_shoulder_pitch", 0.3, 1.0),  # 0, range=[-1.745329, 1.745329]
+            ("right_shoulder_yaw", 0.0, 1.0),  # 1, range=[-1.134464, 0.872665]
+            ("right_elbow_yaw", 0.0, 1.0),  # 2, range=[-1.570796, 1.570796]
+            ("left_shoulder_pitch", 0.3, 1.0),  # 3, range=[-1.745329, 1.745329]
+            ("left_shoulder_yaw", 0.0, 1.0),  # 4, range=[-1.134464, 0.872665]
+            ("left_elbow_yaw", 0.0, 1.0),  # 5, range=[-1.570796, 1.570796]
+            # Legs second (qposadr 13-22)
+            ("right_hip_pitch", 0.2, 0.01),  # 6, range=[-1.570796, 1.570796]
+            ("right_hip_yaw", 0.0, 1.0),  # 7, range=[-1.570796, 0.087266]
+            ("right_hip_roll", -0.785, 1.0),  # 8, range=[-0.785398, 0.785398]
+            ("right_knee_pitch", -3.14, 0.01),  # 9, range=[-4.712389, -1.570796] - BENT BACKWARDS
+            ("right_ankle_pitch", 0.4, 0.01),  # 10, range=[-1.570796, 1.570796]
+            ("left_hip_pitch", 0.2, 0.01),  # 11, range=[-1.570796, 1.570796]
+            ("left_hip_yaw", -0.2, 1.0),  # 12, range=[-1.570796, 0.087266]
+            ("left_hip_roll", 0.785, 1.0),  # 13, range=[-0.785398, 0.785398]
+            ("left_knee_pitch", 0.0, 0.01),  # 14, range=[-1.570796, 1.570796] - STRAIGHT
+            ("left_ankle_pitch", 0.0, 0.01),  # 15, range=[-1.570796, 1.570796]
         ],
         "foot_sites": {
             "left": "left_ankle_pitch_site",
@@ -100,7 +104,7 @@ ROBOT_CONFIGS = {
 NUM_JOINTS: int = 16
 NUM_COMMANDS: int = 6
 JOINT_BIASES: list[tuple[str, float, float]] = ROBOT_CONFIGS["zeroth"]["joint_biases"]
-COMMAND_NAME = "zero_command"
+COMMAND_NAME = "unified"
 
 # Initialize with zeroth robot dimensions (16 joints, WITH IMU)
 ACTOR_DIM: dict[str, int] = dict(
@@ -311,15 +315,15 @@ class UnifiedCommand(ksim.Command):
         new_command = self.initial_command(physics_data, curriculum_level, rng_b)
         return jnp.where(switch_mask, new_command, continued_command)
 
-    def get_markers(self) -> list[ksim.vis.Marker]:
+    def get_markers(self, name: str) -> list[ksim.vis.Marker]:
         """Return markers for visualizing the unified command components."""
         return [
             UnifiedAbsoluteYawCommandMarker.get(
-                command_name=self.command_name,
+                command_name=name,
                 height=0.7,
             ),
             UnifiedLinearVelocityCommandMarker.get(
-                command_name=self.command_name,
+                command_name=name,
                 height=0.5,
             ),
         ]
@@ -1029,7 +1033,19 @@ class Actor(eqx.Module):
 
         mean_nm = mean_nm + jnp.array([v for _, v, _ in JOINT_BIASES])[:, None]
 
-        dist_n = ksim.MixtureOfGaussians(means_nm=mean_nm, stds_nm=std_nm, logits_nm=logits_nm)
+        # Create mixture of Gaussians using distrax
+        # For each joint, we have a mixture of num_mixtures Gaussians
+        # Create component distributions (Gaussians) for each joint
+        components_dist = distrax.Normal(loc=mean_nm, scale=std_nm)
+
+        # Create mixture weights from logits for each joint
+        mixture_dist = distrax.Categorical(logits=logits_nm)
+
+        # Create the mixture distribution
+        dist_n = distrax.MixtureSameFamily(
+            mixture_distribution=mixture_dist,
+            components_distribution=components_dist
+        )
 
         return dist_n, jnp.stack(out_carries, axis=0)
 
@@ -1393,6 +1409,14 @@ class FeetechTorqueObservation(ksim.Observation):
         return actuator_state.last_computed_torque
 
 
+def camel_to_snake(name: str) -> str:
+    """Convert CamelCase to snake_case."""
+    # Insert an underscore before any uppercase letter that follows a lowercase letter
+    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+    # Insert an underscore before any uppercase letter that follows a lowercase or uppercase letter
+    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
+
 class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
     delta_max_j: jnp.ndarray | None = None  # set later in get_actuators
 
@@ -1403,6 +1427,15 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         robot_config = ROBOT_CONFIGS[config.robot]
         NUM_JOINTS = robot_config["num_joints"]
         JOINT_BIASES = robot_config["joint_biases"]
+
+        # Debug: Print config
+        if config.inspect_start:
+            print(f"\n{'='*60}")
+            print(f"[INSPECT MODE ENABLED]")
+            print(f"Robot will be held in reference pose:")
+            for name, value, _ in JOINT_BIASES:
+                print(f"  {name:25s}: {value:7.4f} rad ({math.degrees(value):7.2f}°)")
+            print(f"{'='*60}\n")
 
         # Auto-enable IMU for robots that have IMU sensors
         if robot_config["has_imu"]:
@@ -1454,14 +1487,71 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         return optimizer
 
     def get_mujoco_model(self) -> mujoco.MjModel:
-        mjcf_path = asyncio.run(ksim.get_mujoco_model_path(self.config.robot, name="robot"))
+        # Check if local custom robot MJCF exists
+        local_mjcf = Path("meshes/robot.mjcf")
+        if local_mjcf.exists():
+            mjcf_path = str(local_mjcf.absolute())
+        else:
+            mjcf_path = asyncio.run(ksim.get_mujoco_model_path(self.config.robot, name="robot"))
         model = mujoco_scenes.mjcf.load_mjmodel(mjcf_path, scene="smooth")
         names_to_idxs = ksim.get_geom_data_idx_by_name(model)
         model.geom_priority[names_to_idxs["floor"]] = 2.0
         return model
 
     def get_mujoco_model_metadata(self, mj_model: mujoco.MjModel) -> Metadata:
-        metadata = asyncio.run(ksim.get_mujoco_model_metadata(self.config.robot))
+        # Check if local custom robot metadata exists
+        local_metadata = Path("meshes/metadata.json")
+        if local_metadata.exists():
+            import json
+            from ksim.types import JointMetadata, ActuatorMetadata
+
+            with open(local_metadata, 'r') as f:
+                metadata_dict = json.load(f)
+
+            # Convert joint metadata dicts to JointMetadata objects
+            joint_metadata = {}
+            for joint_name, joint_dict in metadata_dict["joint_name_to_metadata"].items():
+                # Convert string values to appropriate types
+                joint_data = {
+                    "kp": float(joint_dict["kp"]) if joint_dict.get("kp") else None,
+                    "kd": float(joint_dict["kd"]) if joint_dict.get("kd") else None,
+                    "armature": float(joint_dict["armature"]) if joint_dict.get("armature") else None,
+                    "friction": float(joint_dict["friction"]) if joint_dict.get("friction") else None,
+                    "actuator_type": joint_dict.get("actuator_type"),
+                    "soft_torque_limit": float(joint_dict["soft_torque_limit"]) if joint_dict.get("soft_torque_limit") else None,
+                }
+                joint_metadata[joint_name] = JointMetadata(**joint_data)
+
+            # Convert actuator metadata dicts to ActuatorMetadata objects
+            actuator_metadata = {}
+            for actuator_type, actuator_dict in metadata_dict["actuator_type_to_metadata"].items():
+                actuator_data = {
+                    "actuator_type": actuator_dict.get("actuator_type"),
+                    "sys_id": actuator_dict.get("sysid"),
+                    "max_torque": float(actuator_dict["max_torque"]) if actuator_dict.get("max_torque") else None,
+                    "armature": float(actuator_dict["armature"]) if actuator_dict.get("armature") else None,
+                    "damping": float(actuator_dict["damping"]) if actuator_dict.get("damping") else None,
+                    "frictionloss": float(actuator_dict["frictionloss"]) if actuator_dict.get("frictionloss") else None,
+                    "vin": float(actuator_dict["vin"]) if actuator_dict.get("vin") else None,
+                    "kt": float(actuator_dict["kt"]) if actuator_dict.get("kt") else None,
+                    "R": float(actuator_dict["R"]) if actuator_dict.get("R") else None,
+                    "vmax": float(actuator_dict["vmax"]) if actuator_dict.get("vmax") else None,
+                    "amax": float(actuator_dict["amax"]) if actuator_dict.get("amax") else None,
+                    "max_velocity": float(actuator_dict["max_velocity"]) if actuator_dict.get("max_velocity") else None,
+                    "max_pwm": float(actuator_dict["max_pwm"]) if actuator_dict.get("max_pwm") else None,
+                    "error_gain": float(actuator_dict["error_gain"]) if actuator_dict.get("error_gain") else None,
+                }
+                actuator_metadata[actuator_type] = ActuatorMetadata(**actuator_data)
+
+            # Create Metadata object
+            control_frequency = float(metadata_dict["control_frequency"]) if metadata_dict.get("control_frequency") else None
+            metadata = Metadata(
+                joint_name_to_metadata=joint_metadata,
+                actuator_type_to_metadata=actuator_metadata,
+                control_frequency=control_frequency
+            )
+        else:
+            metadata = asyncio.run(ksim.get_mujoco_model_metadata(self.config.robot))
         # Ensure we're returning a proper RobotURDFMetadataOutput
         if not isinstance(metadata, Metadata):
             raise ValueError("Metadata is not a Metadata")
@@ -1566,28 +1656,23 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             torque_noise_type="none",
         )
 
-    def get_physics_randomizers(self, physics_model: ksim.PhysicsModel) -> list[ksim.PhysicsRandomizer]:
-        return [
-            ksim.StaticFrictionRandomizer(),
-            ksim.ArmatureRandomizer(),
-            ksim.AllBodiesMassMultiplicationRandomizer(scale_lower=0.95, scale_upper=1.15),
-            ksim.JointDampingRandomizer(),
-            ksim.JointZeroPositionRandomizer(scale_lower=math.radians(-2), scale_upper=math.radians(2)),
-        ]
+    def get_physics_randomizers(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.PhysicsRandomizer]:
+        return {
+            "static_friction": ksim.StaticFrictionRandomizer(),
+            "armature": ksim.ArmatureRandomizer(),
+            "mass": ksim.AllBodiesMassMultiplicationRandomizer(scale_lower=0.95, scale_upper=1.15),
+            "damping": ksim.JointDampingRandomizer(),
+            "joint_zero": ksim.JointZeroPositionRandomizer(scale_lower=math.radians(-2), scale_upper=math.radians(2)),
+        }
 
-    def get_events(self, physics_model: ksim.PhysicsModel) -> tuple[ksim.Event, ...]:
-        return (
-            ksim.PushEvent(
-                x_force=1.0,
-                y_force=1.0,
-                z_force=0.3,
-                force_range=(0.5, 1.0),
-                x_angular_force=0.0,
-                y_angular_force=0.0,
-                z_angular_force=0.0,
+    def get_events(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.Event]:
+        return {
+            "push": ksim.LinearPushEvent(
+                linvel=1.0,
+                vel_range=(0.5, 1.0),
                 interval_range=(0.5, 4.0),
             ),
-        )
+        }
 
     def get_resets(self, physics_model: ksim.PhysicsModel) -> tuple[ksim.Reset, ...]:
         return (
@@ -1596,10 +1681,10 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             # ksim.RandomHeadingReset(), # because only naive forward reward is used at the moment
         )
 
-    def get_observations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Observation]:
+    def get_observations(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.Observation]:
         obs_list = [
-            ksim.JointPositionObservation(noise=math.radians(0.00)),
-            ksim.JointVelocityObservation(noise=math.radians(0.0)),
+            ksim.JointPositionObservation(noise=ksim.AdditiveGaussianNoise(std=math.radians(0.00))),
+            ksim.JointVelocityObservation(noise=ksim.AdditiveGaussianNoise(std=math.radians(0.0))),
             ksim.ActuatorForceObservation(),
             FeetechTorqueObservation(),
             ksim.CenterOfMassInertiaObservation(),
@@ -1620,18 +1705,19 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 ksim.ProjectedGravityObservation.create(
                     physics_model=physics_model,
                     framequat_name="imu_site_quat",
-                    lag_range=(0.0, 0.1),
-                    noise=math.radians(1),
+                    min_lag=0.0,
+                    max_lag=0.1,
+                    noise=ksim.AdditiveGaussianNoise(std=math.radians(1)),
                 ),
                 ksim.SensorObservation.create(
                     physics_model=physics_model,
                     sensor_name="imu_acc",
-                    noise=0.5,
+                    noise=ksim.AdditiveGaussianNoise(std=0.5),
                 ),
                 ksim.SensorObservation.create(
                     physics_model=physics_model,
                     sensor_name="imu_gyro",
-                    noise=math.radians(0),
+                    noise=ksim.AdditiveGaussianNoise(std=math.radians(0)),
                 ),
             ]
 
@@ -1640,10 +1726,10 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         # IMU UNDO: Comment out foot touch/force sensors if use_imu=False (they're usually paired with IMU)
         if self.config.use_imu:
             obs_list += [
-                ksim.SensorObservation.create(physics_model=physics_model, sensor_name="left_foot_touch", noise=0.0),
-                ksim.SensorObservation.create(physics_model=physics_model, sensor_name="right_foot_touch", noise=0.0),
-                ksim.SensorObservation.create(physics_model=physics_model, sensor_name="left_foot_force", noise=0.0),
-                ksim.SensorObservation.create(physics_model=physics_model, sensor_name="right_foot_force", noise=0.0),
+                ksim.SensorObservation.create(physics_model=physics_model, sensor_name="left_foot_touch", noise=ksim.AdditiveGaussianNoise(std=0.0)),
+                ksim.SensorObservation.create(physics_model=physics_model, sensor_name="right_foot_touch", noise=ksim.AdditiveGaussianNoise(std=0.0)),
+                ksim.SensorObservation.create(physics_model=physics_model, sensor_name="left_foot_force", noise=ksim.AdditiveGaussianNoise(std=0.0)),
+                ksim.SensorObservation.create(physics_model=physics_model, sensor_name="right_foot_force", noise=ksim.AdditiveGaussianNoise(std=0.0)),
             ]
 
         robot_config = ROBOT_CONFIGS[self.config.robot]
@@ -1657,11 +1743,28 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             ),
         ]
 
-        return obs_list
+        # Convert list to dict using class name as key
+        obs_dict = {}
+        for i, obs in enumerate(obs_list):
+            # Generate a unique key based on class name
+            class_name = obs.__class__.__name__
+            # Convert to snake_case
+            key = camel_to_snake(class_name)
 
-    def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
-        return [
-            UnifiedCommand(
+            # Special handling for SensorObservation: append sensor_name
+            if hasattr(obs, 'sensor_name'):
+                key = f"{key}_{obs.sensor_name}"
+            elif key in obs_dict:
+                # If duplicate key, add index suffix
+                key = f"{key}_{i}"
+
+            obs_dict[key] = obs
+
+        return obs_dict
+
+    def get_commands(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.Command]:
+        return {
+            "unified": UnifiedCommand(
                 vx_range=(-0.8, 0.8),      # Forward/backward velocity
                 vy_range=(-0.5, 0.5),      # Left/right velocity
                 wz_range=(-0.8, 0.8),      # Turning velocity
@@ -1672,13 +1775,13 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 ctrl_dt=self.config.ctrl_dt,
                 switch_prob=0.02,          # 2% chance to switch command each step
             )
-        ]
+        }
 
-    def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
+    def get_rewards(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.Reward]:
         robot_config = ROBOT_CONFIGS[self.config.robot]
         rewards = [
-            ksim.NaiveForwardReward(clip_max=1.25, in_robot_frame=False, scale=3.0),
-            ksim.NaiveForwardOrientationReward(scale=1.0),
+            LinearVelocityTrackingReward(scale=3.0),
+            XYOrientationReward(scale=1.0),
             ksim.StayAliveReward(scale=4.0),
             ksim.UprightReward(scale=0.5),
             FeetOrientationReward.create(
@@ -1716,16 +1819,27 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 ),
             ])
 
-        return rewards
+        # Convert list to dict using class name as key
+        rewards_dict = {}
+        for i, reward in enumerate(rewards):
+            # Generate a unique key based on class name
+            class_name = reward.__class__.__name__
+            # Convert to snake_case
+            key = camel_to_snake(class_name)
+            if key in rewards_dict:
+                key = f"{key}_{i}"
+            rewards_dict[key] = reward
 
-    def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
+        return rewards_dict
+
+    def get_terminations(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.Termination]:
         # List all termination conditions:
-        # 1. BadZTermination: base height < 0.05m or > 0.5m
+        # 1. BadZTermination: base height < 0.15m or > 4.5m
         # 2. NotUprightTermination: tilt > 60 degrees
-        return [
-            ksim.BadZTermination(unhealthy_z_lower=0.15, unhealthy_z_upper=4.5),
-            # ksim.NotUprightTermination(max_radians=math.radians(60)),
-        ]
+        return {
+            "bad_z": ksim.BadZTermination(min_z=0.15, max_z=4.5),
+            # "not_upright": ksim.NotUprightTermination(max_radians=math.radians(60)),
+        }
 
     def get_curriculum(self, physics_model: ksim.PhysicsModel) -> ksim.Curriculum:
         return ksim.EpisodeLengthCurriculum(
@@ -1736,9 +1850,9 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             min_level=0.5,
         )
 
-    def get_model(self, key: PRNGKeyArray) -> Model:
+    def get_model(self, params: ksim.task.rl.InitParams) -> Model:
         return Model(
-            key,
+            params.key,
             num_inputs=NUM_ACTOR_INPUTS,
             num_outputs=NUM_JOINTS,
             min_std=0.03,
@@ -1865,7 +1979,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
             next_carry = jax.tree.map(
                 lambda x, y: jnp.where(transition.done, x, y),
-                self.get_initial_model_carry(rng),
+                self.get_initial_model_carry(model, step_key),
                 (next_actor_carry, next_critic_carry),
             )
 
@@ -1875,7 +1989,7 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
         return ppo_variables, next_model_carry
 
-    def get_initial_model_carry(self, rng: PRNGKeyArray) -> tuple[Array, Array]:
+    def get_initial_model_carry(self, model: Model, rng: PRNGKeyArray) -> tuple[Array, Array]:
         return (
             jnp.zeros(shape=(self.config.depth, self.config.hidden_size)),
             jnp.zeros(shape=(self.config.depth, self.config.hidden_size)),
