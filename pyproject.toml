@@ -1,3 +1,21 @@
+[project]
+name = ""
+version = "0.0.1"
+dependencies = [
+    "ksim==0.2.10",
+    "xax==0.4.4",
+    "distrax==0.1.7",
+    "equinox==0.13.2",
+    "attrs==25.4.0",
+    "mujoco==3.3.7",
+    "mujoco-mjx==3.3.7",
+    "mujoco-scenes==0.0.17",
+    "protobuf<4",
+    "kinfer[jax]",
+    "jax[cuda12]>=0.8.0",
+    "warp-lang>=1.9.1",
+]
+
 [tool.pytest.ini_options]
 
 addopts = "-rx -rf -x -q --full-trace"
@@ -23,6 +41,9 @@ warn_redundant_casts = true
 
 incremental = true
 namespace_packages = false
+
+[tool.uv]
+package = false
 
 [[tool.mypy.overrides]]
 
