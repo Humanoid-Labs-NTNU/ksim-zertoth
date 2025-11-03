@@ -588,10 +588,13 @@ class FeetAirtimeReward(ksim.StatefulReward):
         left_air_shifted = jnp.roll(left_air, 1)
         right_air_shifted = jnp.roll(right_air, 1)
 
-        left_feet_airtime_reward = (left_air_shifted - self.touchdown_penalty) * td_l.astype(jnp.float32)
-        right_feet_airtime_reward = (right_air_shifted - self.touchdown_penalty) * td_r.astype(jnp.float32)
+        left_touchdown_reward = jnp.maximum(0.0, left_air_shifted - self.touchdown_penalty) * td_l.astype(jnp.float32)
+        right_touchdown_reward = jnp.maximum(0.0, right_air_shifted - self.touchdown_penalty) * td_r.astype(jnp.float32)
 
-        reward = left_feet_airtime_reward + right_feet_airtime_reward
+        left_in_air = jnp.logical_not(left_contact).astype(jnp.float32) * self.ctrl_dt
+        right_in_air = jnp.logical_not(right_contact).astype(jnp.float32) * self.ctrl_dt
+
+        reward = left_touchdown_reward + right_touchdown_reward + left_in_air + right_in_air
 
         # Optional zero-command masking
         if self.stand_still_threshold is not None:
@@ -846,7 +849,7 @@ class FeetTooFarPenalty(ksim.Reward):
 class OrientationPenalty(ksim.Reward):
     """Penalty for deviation from upright orientation beyond a deadzone threshold."""
 
-    deadzone_rad: float = attrs.field(default=0.15)  # ~8.6 degrees deadzone
+    deadzone_rad: float = attrs.field(default=0.22)  # ~12.6 degrees deadzone
     error_scale: float = attrs.field(default=0.25)
     scale: float = attrs.field(default=-5.0)
 
@@ -1196,7 +1199,7 @@ class ZbotWalkingTaskConfig(ksim.PPOConfig):
 
     # Model parameters.
     hidden_size: int = xax.field(
-        value=128,
+        value=192,
         help="The hidden size for the MLPs.",
     )
     depth: int = xax.field(
