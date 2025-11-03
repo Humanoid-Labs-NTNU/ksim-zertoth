@@ -819,6 +819,56 @@ class FeetTooClosePenalty(ksim.Reward):
         return (dist < self.threshold_m).astype(jnp.float32)
 
 
+@attrs.define(frozen=True, kw_only=True)
+class FeetTooFarPenalty(ksim.Reward):
+    """Binary penalty when feet are farther than `threshold_m`.
+
+    Prevents the robot from doing splits to exploit StayAliveReward.
+    For zbot, natural stance is ~0.10m, so threshold of 0.25m is reasonable.
+    """
+
+    feet_pos_obs_key: str = attrs.field(default="feet_position_observation")
+    threshold_m: float = attrs.field(default=0.25)
+    scale: float = attrs.field(default=-1.0)
+
+    def get_reward(self, traj: ksim.Trajectory) -> Array:
+        feet = traj.obs[self.feet_pos_obs_key]
+        left = feet[..., :3]
+        right = feet[..., 3:]
+
+        # Get the euclidean distance between the feet.
+        dist = jnp.linalg.norm(left - right, axis=-1)
+
+        return (dist > self.threshold_m).astype(jnp.float32)
+
+
+@attrs.define(frozen=True)
+class OrientationPenalty(ksim.Reward):
+    """Penalty for deviation from upright orientation beyond a deadzone threshold."""
+
+    deadzone_rad: float = attrs.field(default=0.15)  # ~8.6 degrees deadzone
+    error_scale: float = attrs.field(default=0.25)
+    scale: float = attrs.field(default=-5.0)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        # Get roll and pitch from base quaternion
+        euler_orientation = xax.quat_to_euler(trajectory.xquat[:, 1, :])
+        roll = euler_orientation[:, 0]
+        pitch = euler_orientation[:, 1]
+
+        # Apply deadzone - only penalize if abs(angle) > deadzone
+        roll_error = jnp.maximum(0.0, jnp.abs(roll) - self.deadzone_rad)
+        pitch_error = jnp.maximum(0.0, jnp.abs(pitch) - self.deadzone_rad)
+
+        # Compute total orientation error
+        orientation_error = roll_error**2 + pitch_error**2
+
+        # Return penalty (exponential penalty for deviations beyond deadzone)
+        # Returns 0 when error=0, approaches 1 as error increases
+        # Multiplied by negative scale to create penalty
+        return 1.0 - jnp.exp(-orientation_error / self.error_scale)
+
+
 def rotate_quat_by_quat(quat_to_rotate: Array, rotating_quat: Array, inverse: bool = False, eps: float = 1e-6) -> Array:
     """Rotates one quaternion by another quaternion through quaternion multiplication.
 
@@ -1781,9 +1831,10 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
         robot_config = ROBOT_CONFIGS[self.config.robot]
         rewards = [
             LinearVelocityTrackingReward(scale=3.0),
+            AngularVelocityTrackingReward(scale=3.0),
             XYOrientationReward(scale=1.0),
-            ksim.StayAliveReward(scale=4.0),
-            ksim.UprightReward(scale=0.5),
+            ksim.StayAliveReward(scale=1.0),
+            OrientationPenalty(deadzone_rad=0.15, error_scale=0.25, scale=-5.0),
             FeetOrientationReward.create(
                 physics_model,
                 left_name=robot_config["foot_bodies"]["left"],
@@ -1796,6 +1847,11 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
                 feet_pos_obs_key="feet_position_observation",
                 threshold_m=0.12,
                 scale=-0.005,
+            ),
+            FeetTooFarPenalty(
+                feet_pos_obs_key="feet_position_observation",
+                threshold_m=0.25,
+                scale=-2.0,
             ),
             StraightLegPenalty.create_penalty(physics_model, scale=-0.5, scale_by_curriculum=True),
             AnkleKneePenalty.create_penalty(physics_model, scale=-0.025, scale_by_curriculum=True, robot_name=self.config.robot),
