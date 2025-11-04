@@ -40,7 +40,8 @@ def rotate_quat_by_quat(
     return out / (jnp.linalg.norm(out, axis=-1, keepdims=True) + eps)
 
 
-NUM_COMMANDS = 6  # vx, vy, heading, bh, rx, ry
+# Command names: vx, vy, wz, heading, bh, rx, ry
+COMMAND_NAMES = ["vx", "vy", "wz", "heading", "bh", "rx", "ry"]
 
 
 def main() -> None:
@@ -53,57 +54,78 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint path {ckpt_path} does not exist")
 
     task: ZbotWalkingTask = ZbotWalkingTask.load_task(ckpt_path)
-    model: Model = task.load_ckpt(ckpt_path, part="model")[0]
 
-    # Loads the Mujoco model and gets the joint names.
+    # Load mujoco model first for init_params
     mujoco_model = task.get_mujoco_model()
-    joint_names = ksim.get_joint_names_in_order(mujoco_model)[1:]  # Removes the root joint.
 
+    # Create init params for model loading
+    init_params = ksim.task.rl.InitParams(key=jax.random.PRNGKey(0), physics_model=mujoco_model)
+    model: Model = task.load_ckpt(ckpt_path, part="model", init_params=init_params)[0]
+
+    joint_names = ksim.get_joint_names_in_order(mujoco_model)[1:]  # Removes the root joint.
     carry_shape = (task.config.depth, task.config.hidden_size)
 
-    @jax.jit
     def init_fn() -> Array:
         return jnp.zeros(carry_shape)
 
-    @jax.jit
     def step_fn(
         joint_angles: Array,
         joint_angular_velocities: Array,
         quaternion: Array,
-        initial_heading: Array,
         command: Array,
         carry: Array,
     ) -> tuple[Array, Array]:
-        heading_quat = xax.euler_to_quat(jnp.array([0.0, 0.0, command[..., 2]]))
-        init_quat = xax.euler_to_quat(jnp.array([0.0, 0.0, initial_heading.squeeze()]))
+        # Compute projected gravity from quaternion (IMU simulation)
+        # Gravity is [0, 0, -1] in world frame, rotate by inverse quaternion
+        gravity = jnp.array([0.0, 0.0, -1.0])
+        # Quaternion rotation: q^-1 * v * q
+        w, x, y, z = quaternion[0], quaternion[1], quaternion[2], quaternion[3]
+        quat_inv = jnp.array([w, -x, -y, -z])
 
-        rel_quat = rotate_quat_by_quat(quaternion, init_quat, inverse=True)
-        spun_quat = rotate_quat_by_quat(rel_quat, heading_quat, inverse=True)
-        spun_quat = jnp.where(spun_quat[..., 0] < 0, -spun_quat, spun_quat)
+        # Rotate gravity vector by inverse quaternion
+        t = 2.0 * jnp.cross(quat_inv[1:], gravity)
+        projected_gravity = gravity + quat_inv[0] * t + jnp.cross(quat_inv[1:], t)
 
+        # Build observation matching train.py run_actor with use_imu=True
         obs = jnp.concatenate(
             [
-                joint_angles,
-                joint_angular_velocities,
-                spun_quat,
-                command[..., :2],  # vx, vy
-                command[..., 2:3],  # heading
-                command[..., 3:],  # bh, rx, ry
+                joint_angles,              # NUM_JOINTS
+                joint_angular_velocities,  # NUM_JOINTS
+                projected_gravity,         # 3 (IMU)
+                command[..., :2],          # vx, vy
+                command[..., 3:4],         # heading (index 3!)
+                command[..., 4:],          # bh, rx, ry
             ],
             axis=-1,
         )
 
         dist, carry = model.actor.forward(obs, carry)
-        return dist.mode(), carry
+        # For MixtureSameFamily, get the mean of the highest-weight component
+        # dist.mixture_distribution is Categorical with logits
+        # dist.components_distribution is Normal with loc and scale
+        mixture_probs = jax.nn.softmax(dist.mixture_distribution.logits, axis=-1)  # shape: (num_joints, num_mixtures)
+        best_component_idx = jnp.argmax(mixture_probs, axis=-1)  # shape: (num_joints,)
+
+        # Get means from components - shape: (num_joints, num_mixtures)
+        component_means = dist.components_distribution.loc
+
+        # Select the mean from the best component for each joint
+        action = jnp.take_along_axis(component_means, best_component_idx[:, None], axis=1).squeeze(-1)
+
+        return action, carry
 
     metadata = PyModelMetadata(
         joint_names=joint_names,
-        num_commands=NUM_COMMANDS,
+        command_names=COMMAND_NAMES,
         carry_size=carry_shape,
     )
 
-    init_onnx = export_fn(init_fn, metadata)
-    step_onnx = export_fn(step_fn, metadata)
+    # JIT the functions - jax.jit() returns Wrapped objects that kinfer expects
+    init_wrapped = jax.jit(init_fn)
+    step_wrapped = jax.jit(step_fn)
+
+    init_onnx = export_fn(init_wrapped, metadata)
+    step_onnx = export_fn(step_wrapped, metadata)
     kinfer_model = pack(init_onnx, step_onnx, metadata)
 
     out_path = Path(args.output_path)
