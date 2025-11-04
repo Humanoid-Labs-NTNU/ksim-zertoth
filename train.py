@@ -568,8 +568,10 @@ class FeetAirtimeReward(ksim.StatefulReward):
         return carry, airtime
 
     def get_reward_stateful(self, traj: ksim.Trajectory, reward_carry: PyTree) -> tuple[Array, PyTree]:
-        left_contact = jnp.where(traj.obs["sensor_observation_left_foot_touch"] > 0.1, True, False)[:, 0]
-        right_contact = jnp.where(traj.obs["sensor_observation_right_foot_touch"] > 0.1, True, False)[:, 0]
+        feet_pos = traj.obs["feet_position_observation"]
+        contact_threshold = 0.02
+        left_contact = feet_pos[:, 2] < contact_threshold
+        right_contact = feet_pos[:, 5] < contact_threshold
 
         # airtime counters
         left_carry, left_air = self._airtime_sequence(reward_carry[0], left_contact, traj.done)
@@ -585,8 +587,8 @@ class FeetAirtimeReward(ksim.StatefulReward):
         td_l = touchdown(left_contact)
         td_r = touchdown(right_contact)
 
-        left_air_shifted = jnp.roll(left_air, 1)
-        right_air_shifted = jnp.roll(right_air, 1)
+        left_air_shifted = jnp.concatenate([jnp.array([0.0]), left_air[:-1]])
+        right_air_shifted = jnp.concatenate([jnp.array([0.0]), right_air[:-1]])
 
         left_touchdown_reward = jnp.maximum(0.0, left_air_shifted - self.touchdown_penalty) * td_l.astype(jnp.float32)
         right_touchdown_reward = jnp.maximum(0.0, right_air_shifted - self.touchdown_penalty) * td_r.astype(jnp.float32)
@@ -773,9 +775,11 @@ class SimpleSingleFootContactReward(ksim.Reward):
     stand_still_threshold: float | None = 1e-3
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
-        left_contact = jnp.where(traj.obs["sensor_observation_left_foot_touch"] > 0.1, True, False).squeeze()
-        right_contact = jnp.where(traj.obs["sensor_observation_right_foot_touch"] > 0.1, True, False).squeeze()
-        single = jnp.logical_xor(left_contact, right_contact).squeeze()
+        feet_pos = traj.obs["feet_position_observation"]
+        contact_threshold = 0.02
+        left_contact = feet_pos[:, 2] < contact_threshold
+        right_contact = feet_pos[:, 5] < contact_threshold
+        single = jnp.logical_xor(left_contact, right_contact)
 
         if self.stand_still_threshold is not None:
             is_zero_cmd = jnp.linalg.norm(traj.command[COMMAND_NAME][:, :3], axis=-1) < self.stand_still_threshold
@@ -1776,14 +1780,6 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
 
         obs_list += [
         ]
-        # IMU UNDO: Comment out foot touch/force sensors if use_imu=False (they're usually paired with IMU)
-        if self.config.use_imu:
-            obs_list += [
-                ksim.SensorObservation.create(physics_model=physics_model, sensor_name="left_foot_touch", noise=ksim.AdditiveGaussianNoise(std=0.0)),
-                ksim.SensorObservation.create(physics_model=physics_model, sensor_name="right_foot_touch", noise=ksim.AdditiveGaussianNoise(std=0.0)),
-                ksim.SensorObservation.create(physics_model=physics_model, sensor_name="left_foot_force", noise=ksim.AdditiveGaussianNoise(std=0.0)),
-                ksim.SensorObservation.create(physics_model=physics_model, sensor_name="right_foot_force", noise=ksim.AdditiveGaussianNoise(std=0.0)),
-            ]
 
         robot_config = ROBOT_CONFIGS[self.config.robot]
         obs_list += [
@@ -1833,10 +1829,9 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
     def get_rewards(self, physics_model: ksim.PhysicsModel) -> dict[str, ksim.Reward]:
         robot_config = ROBOT_CONFIGS[self.config.robot]
         rewards = [
-            LinearVelocityTrackingReward(scale=3.0),
-            AngularVelocityTrackingReward(scale=3.0),
+            LinearVelocityTrackingReward(scale=5.0),
+            AngularVelocityTrackingReward(scale=5.0),
             XYOrientationReward(scale=1.0),
-            ksim.StayAliveReward(scale=1.0),
             OrientationPenalty(deadzone_rad=0.15, error_scale=0.25, scale=-5.0),
             FeetOrientationReward.create(
                 physics_model,
@@ -1862,19 +1857,14 @@ class ZbotWalkingTask(ksim.PPOTask[ZbotWalkingTaskConfig]):
             ArmPosePenalty.create_penalty(physics_model, scale=-0.5, scale_by_curriculum=True, robot_name=self.config.robot),
         ]
 
-        # Only add sensor-based rewards if the robot has IMU/touch sensors
         if self.config.use_imu:
             rewards.extend([
-                SimpleSingleFootContactReward(scale=0.3, stand_still_threshold=None),
+                SimpleSingleFootContactReward(scale=0.5, stand_still_threshold=None),
                 FeetAirtimeReward(
-                    scale=0.1,
+                    scale=0.5,
                     ctrl_dt=self.config.ctrl_dt,
                     touchdown_penalty=0.1,
                     stand_still_threshold=None,
-                ),
-                ContactForcePenalty(
-                    scale=-0.03,
-                    sensor_names=("sensor_observation_left_foot_force", "sensor_observation_right_foot_force"),
                 ),
             ])
 
